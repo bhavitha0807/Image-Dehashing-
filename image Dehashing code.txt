@@ -1,0 +1,2255 @@
+def get_dark_channel(image, w=15):
+    """
+    Get the dark channel prior in the (RGB) image data.
+    Parameters
+    -----------
+    image:  an M * N * 3 numpy array containing data ([0, L-1]) in the image where
+        M is the height, N is the width, 3 represents R/G/B channels.
+    w:  window size
+    Return
+    -----------
+    An M * N array for the dark channel prior ([0, L-1]).
+    """
+    M, N, _ = image.shape
+    padded = np.pad(image, ((w // 2, w // 2), (w // 2, w // 2), (0, 0)), 'edge')
+    darkch = np.zeros((M, N))
+    for i, j in np.ndindex(darkch.shape):
+        darkch[i, j] = np.min(padded[i:i + w, j:j + w, :])  # CVPR09, eq.5
+    return darkch
+
+
+def get_atmosphere(image, p=0.0001, w=15):
+    """Get the atmosphere light in the (RGB) image data.
+    Parameters
+    -----------
+    image:      the 3 * M * N RGB image data ([0, L-1]) as numpy array
+    w:      window for dark channel
+    p:      percentage of pixels for estimating the atmosphere light
+    Return
+    -----------
+    A 3-element array containing atmosphere light ([0, L-1]) for each channel
+    """
+    image = image.transpose(1, 2, 0)
+    # reference CVPR09, 4.4
+    darkch = get_dark_channel(image, w)
+    M, N = darkch.shape
+    flatI = image.reshape(M * N, 3)
+    flatdark = darkch.ravel()
+    searchidx = (-flatdark).argsort()[:int(M * N * p)]  # find top M * N * p indexes
+    # return the highest intensity for each channel
+    return np.max(flatI.take(searchidx, axis=0), axis=0)
+  import numpy as np
+from scipy.ndimage import filters, measurements, interpolation
+from math import pi
+def imresize(im, scale_factor=None, output_shape=None, kernel=None, antialiasing=True, kernel_shift_flag=False):
+    # First standardize values and fill missing arguments (if needed) by deriving scale from output shape or vice versa
+    scale_factor, output_shape = fix_scale_and_size(im.shape, output_shape, scale_factor)
+
+    # For a given numeric kernel case, just do convolution and sub-sampling (downscaling only)
+    if type(kernel) == np.ndarray and scale_factor[0] <= 1:
+        return numeric_kernel(im, kernel, scale_factor, output_shape, kernel_shift_flag)
+
+    # Choose interpolation method, each method has the matching kernel size
+    method, kernel_width = {
+        "cubic": (cubic, 4.0),
+        "lanczos2": (lanczos2, 4.0),
+        "lanczos3": (lanczos3, 6.0),
+        "box": (box, 1.0),
+        "linear": (linear, 2.0),
+        None: (cubic, 4.0)  # set default interpolation method as cubic
+    }.get(kernel)
+
+    # Antialiasing is only used when downscaling
+    antialiasing *= (scale_factor[0] < 1)
+
+    # Sort indices of dimensions according to scale of each dimension. since we are going dim by dim this is efficient
+    sorted_dims = np.argsort(np.array(scale_factor)).tolist()
+
+    # Iterate over dimensions to calculate local weights for resizing and resize each time in one direction
+    out_im = np.copy(im)
+    for dim in sorted_dims:
+        # No point doing calculations for scale-factor 1. nothing will happen anyway
+        if scale_factor[dim] == 1.0:
+            continue
+
+        # for each coordinate (along 1 dim), calculate which coordinates in the input image affect its result and the
+        # weights that multiply the values there to get its result.
+        weights, field_of_view = contributions(im.shape[dim], output_shape[dim], scale_factor[dim],
+                                               method, kernel_width, antialiasing)
+
+        # Use the affecting position values and the set of weights to calculate the result of resizing along this 1 dim
+        out_im = resize_along_dim(out_im, dim, weights, field_of_view)
+
+    return out_im
+
+
+def fix_scale_and_size(input_shape, output_shape, scale_factor):
+    # First fixing the scale-factor (if given) to be standardized the function expects (a list of scale factors in the
+    # same size as the number of input dimensions)
+    if scale_factor is not None:
+        # By default, if scale-factor is a scalar we assume 2d resizing and duplicate it.
+        if np.isscalar(scale_factor):
+            scale_factor = [scale_factor, scale_factor]
+
+        # We extend the size of scale-factor list to the size of the input by assigning 1 to all the unspecified scales
+        scale_factor = list(scale_factor)
+        scale_factor.extend([1] * (len(input_shape) - len(scale_factor)))
+
+    # Fixing output-shape (if given): extending it to the size of the input-shape, by assigning the original input-size
+    # to all the unspecified dimensions
+    if output_shape is not None:
+        output_shape = list(np.uint(np.array(output_shape))) + list(input_shape[len(output_shape):])
+
+    # Dealing with the case of non-give scale-factor, calculating according to output-shape. note that this is
+    # sub-optimal, because there can be different scales to the same output-shape.
+    if scale_factor is None:
+        scale_factor = 1.0 * np.array(output_shape) / np.array(input_shape)
+
+    # Dealing with missing output-shape. calculating according to scale-factor
+    if output_shape is None:
+        output_shape = np.uint(np.ceil(np.array(input_shape) * np.array(scale_factor)))
+
+    return scale_factor, output_shape
+
+
+def contributions(in_length, out_length, scale, kernel, kernel_width, antialiasing):
+    # This function calculates a set of 'filters' and a set of field_of_view that will later on be applied
+    # such that each position from the field_of_view will be multiplied with a matching filter from the
+    # 'weights' based on the interpolation method and the distance of the sub-pixel location from the pixel centers
+    # around it. This is only done for one dimension of the image.
+
+    # When anti-aliasing is activated (default and only for downscaling) the receptive field is stretched to size of
+    # 1/sf. this means filtering is more 'low-pass filter'.
+    fixed_kernel = (lambda arg: scale * kernel(scale * arg)) if antialiasing else kernel
+    kernel_width *= 1.0 / scale if antialiasing else 1.0
+
+    # These are the coordinates of the output image
+    out_coordinates = np.arange(1, out_length+1)
+
+
+    match_coordinates = 1.0 * out_coordinates / scale + 0.5 * (1 - 1.0 / scale)
+
+    # This is the left boundary to start multiplying the filter from, it depends on the size of the filter
+    left_boundary = np.floor(match_coordinates - kernel_width / 2)
+
+    # Kernel width needs to be enlarged because when covering has sub-pixel borders, it must 'see' the pixel centers
+    # of the pixels it only covered a part from. So we add one pixel at each side to consider (weights can zeroize them)
+    expanded_kernel_width = np.ceil(kernel_width) + 2
+
+    # Determine a set of field_of_view for each each output position, these are the pixels in the input image
+    # that the pixel in the output image 'sees'. We get a matrix whos horizontal dim is the output pixels (big) and the
+    # vertical dim is the pixels it 'sees' (kernel_size + 2)
+    field_of_view = np.squeeze(np.uint(np.expand_dims(left_boundary, axis=1) + np.arange(expanded_kernel_width) - 1))
+
+    # Assign weight to each pixel in the field of view. A matrix whos horizontal dim is the output pixels and the
+    # vertical dim is a list of weights matching to the pixel in the field of view (that are specified in
+    # 'field_of_view')
+    weights = fixed_kernel(1.0 * np.expand_dims(match_coordinates, axis=1) - field_of_view - 1)
+
+    # Normalize weights to sum up to 1. be careful from dividing by 0
+    sum_weights = np.sum(weights, axis=1)
+    sum_weights[sum_weights == 0] = 1.0
+    weights = 1.0 * weights / np.expand_dims(sum_weights, axis=1)
+
+    # We use this mirror structure as a trick for reflection padding at the boundaries
+    mirror = np.uint(np.concatenate((np.arange(in_length), np.arange(in_length - 1, -1, step=-1))))
+    field_of_view = mirror[np.mod(field_of_view, mirror.shape[0])]
+
+    # Get rid of  weights and pixel positions that are of zero weight
+    non_zero_out_pixels = np.nonzero(np.any(weights, axis=0))
+    weights = np.squeeze(weights[:, non_zero_out_pixels])
+    field_of_view = np.squeeze(field_of_view[:, non_zero_out_pixels])
+
+    # Final products are the relative positions and the matching weights, both are output_size X fixed_kernel_size
+    return weights, field_of_view
+
+
+def resize_along_dim(im, dim, weights, field_of_view):
+    # To be able to act on each dim, we swap so that dim 0 is the wanted dim to resize
+    tmp_im = np.swapaxes(im, dim, 0)
+
+    # We add singleton dimensions to the weight matrix so we can multiply it with the big tensor we get for
+    # tmp_im[field_of_view.T], (bsxfun style)
+    weights = np.reshape(weights.T, list(weights.T.shape) + (np.ndim(im) - 1) * [1])
+
+    # This is a bit of a complicated multiplication: tmp_im[field_of_view.T] is a tensor of order image_dims+1.
+    # for each pixel in the output-image it matches the positions the influence it from the input image (along 1 dim
+    # only, this is why it only adds 1 dim to the shape). We then multiply, for each pixel, its set of positions with
+    # the matching set of weights. we do this by this big tensor element-wise multiplication (MATLAB bsxfun style:
+    # matching dims are multiplied element-wise while singletons mean that the matching dim is all multiplied by the
+    # same number
+    tmp_out_im = np.sum(tmp_im[field_of_view.T] * weights, axis=0)
+
+    # Finally we swap back the axes to the original order
+    return np.swapaxes(tmp_out_im, dim, 0)
+
+
+def numeric_kernel(im, kernel, scale_factor, output_shape, kernel_shift_flag):
+    # See kernel_shift function to understand what this is
+    if kernel_shift_flag:
+        kernel = kernel_shift(kernel, scale_factor)
+
+    # First run a correlation (convolution with flipped kernel)
+    out_im = np.zeros_like(im)
+    for channel in range(np.ndim(im)):
+        out_im[:, :, channel] = filters.correlate(im[:, :, channel], kernel)
+
+    # Then subsample and return
+    return out_im[np.round(np.linspace(0, im.shape[0] - 1 / scale_factor[0], output_shape[0])).astype(int)[:, None],
+                  np.round(np.linspace(0, im.shape[1] - 1 / scale_factor[1], output_shape[1])).astype(int), :]
+
+
+def kernel_shift(kernel, sf):
+    # There are two reasons for shifting the kernel:
+    # 1. Center of mass is not in the center of the kernel which creates ambiguity. There is no possible way to know
+    #    the degradation process included shifting so we always assume center of mass is center of the kernel.
+    # 2. We further shift kernel center so that top left result pixel corresponds to the middle of the sfXsf first
+    #    pixels. Default is for odd size to be in the middle of the first pixel and for even sized kernel to be at the
+    #    top left corner of the first pixel. that is why different shift size needed between od and even size.
+    # Given that these two conditions are fulfilled, we are happy and aligned, the way to test it is as follows:
+    # The input image, when interpolated (regular bicubic) is exactly aligned with ground truth.
+
+    # First calculate the current center of mass for the kernel
+    current_center_of_mass = measurements.center_of_mass(kernel)
+
+    # The second ("+ 0.5 * ....") is for applying condition 2 from the comments above
+    wanted_center_of_mass = np.array(kernel.shape) / 2 + 0.5 * (sf - (kernel.shape[0] % 2))
+
+    # Define the shift vector for the kernel shifting (x,y)
+    shift_vec = wanted_center_of_mass - current_center_of_mass
+
+    # Before applying the shift, we first pad the kernel so that nothing is lost due to the shift
+    # (biggest shift among dims + 1 for safety)
+    kernel = np.pad(kernel, np.int(np.ceil(np.max(shift_vec))) + 1, 'constant')
+
+    # Finally shift the kernel and return
+    return interpolation.shift(kernel, shift_vec)
+
+
+# These next functions are all interpolation methods. x is the distance from the left pixel center
+
+
+def imresize(im, scale_factor=None, output_shape=None, kernel=None, antialiasing=True, kernel_shift_flag=False):
+    # First standardize values and fill missing arguments (if needed) by deriving scale from output shape or vice versa
+    scale_factor, output_shape = fix_scale_and_size(im.shape, output_shape, scale_factor)
+
+    # For a given numeric kernel case, just do convolution and sub-sampling (downscaling only)
+    if type(kernel) == np.ndarray and scale_factor[0] <= 1:
+        return numeric_kernel(im, kernel, scale_factor, output_shape, kernel_shift_flag)
+
+    # Choose interpolation method, each method has the matching kernel size
+    method, kernel_width = {
+        "cubic": (cubic, 4.0),
+        "lanczos2": (lanczos2, 4.0),
+        "lanczos3": (lanczos3, 6.0),
+        "box": (box, 1.0),
+        "linear": (linear, 2.0),
+        None: (cubic, 4.0)  # set default interpolation method as cubic
+    }.get(kernel)
+
+    # Antialiasing is only used when downscaling
+    antialiasing *= (scale_factor[0] < 1)
+
+    # Sort indices of dimensions according to scale of each dimension. since we are going dim by dim this is efficient
+    sorted_dims = np.argsort(np.array(scale_factor)).tolist()
+
+    # Iterate over dimensions to calculate local weights for resizing and resize each time in one direction
+    out_im = np.copy(im)
+    for dim in sorted_dims:
+        # No point doing calculations for scale-factor 1. nothing will happen anyway
+        if scale_factor[dim] == 1.0:
+            continue
+
+        # for each coordinate (along 1 dim), calculate which coordinates in the input image affect its result and the
+        # weights that multiply the values there to get its result.
+        weights, field_of_view = contributions(im.shape[dim], output_shape[dim], scale_factor[dim],
+                                               method, kernel_width, antialiasing)
+
+        # Use the affecting position values and the set of weights to calculate the result of resizing along this 1 dim
+        out_im = resize_along_dim(out_im, dim, weights, field_of_view)
+
+    return out_im
+
+
+def fix_scale_and_size(input_shape, output_shape, scale_factor):
+    # First fixing the scale-factor (if given) to be standardized the function expects (a list of scale factors in the
+    # same size as the number of input dimensions)
+    if scale_factor is not None:
+        # By default, if scale-factor is a scalar we assume 2d resizing and duplicate it.
+        if np.isscalar(scale_factor):
+            scale_factor = [scale_factor, scale_factor]
+
+        # We extend the size of scale-factor list to the size of the input by assigning 1 to all the unspecified scales
+        scale_factor = list(scale_factor)
+        scale_factor.extend([1] * (len(input_shape) - len(scale_factor)))
+
+    # Fixing output-shape (if given): extending it to the size of the input-shape, by assigning the original input-size
+    # to all the unspecified dimensions
+    if output_shape is not None:
+        output_shape = list(np.uint(np.array(output_shape))) + list(input_shape[len(output_shape):])
+
+    # Dealing with the case of non-give scale-factor, calculating according to output-shape. note that this is
+    # sub-optimal, because there can be different scales to the same output-shape.
+    if scale_factor is None:
+        scale_factor = 1.0 * np.array(output_shape) / np.array(input_shape)
+
+    # Dealing with missing output-shape. calculating according to scale-factor
+    if output_shape is None:
+        output_shape = np.uint(np.ceil(np.array(input_shape) * np.array(scale_factor)))
+
+    return scale_factor, output_shape
+
+
+def contributions(in_length, out_length, scale, kernel, kernel_width, antialiasing):
+    # This function calculates a set of 'filters' and a set of field_of_view that will later on be applied
+    # such that each position from the field_of_view will be multiplied with a matching filter from the
+    # 'weights' based on the interpolation method and the distance of the sub-pixel location from the pixel centers
+    # around it. This is only done for one dimension of the image.
+
+    # When anti-aliasing is activated (default and only for downscaling) the receptive field is stretched to size of
+    # 1/sf. this means filtering is more 'low-pass filter'.
+    fixed_kernel = (lambda arg: scale * kernel(scale * arg)) if antialiasing else kernel
+    kernel_width *= 1.0 / scale if antialiasing else 1.0
+
+    # These are the coordinates of the output image
+    out_coordinates = np.arange(1, out_length+1)
+
+
+    match_coordinates = 1.0 * out_coordinates / scale + 0.5 * (1 - 1.0 / scale)
+
+    # This is the left boundary to start multiplying the filter from, it depends on the size of the filter
+    left_boundary = np.floor(match_coordinates - kernel_width / 2)
+
+    # Kernel width needs to be enlarged because when covering has sub-pixel borders, it must 'see' the pixel centers
+    # of the pixels it only covered a part from. So we add one pixel at each side to consider (weights can zeroize them)
+    expanded_kernel_width = np.ceil(kernel_width) + 2
+
+    # Determine a set of field_of_view for each each output position, these are the pixels in the input image
+    # that the pixel in the output image 'sees'. We get a matrix whos horizontal dim is the output pixels (big) and the
+    # vertical dim is the pixels it 'sees' (kernel_size + 2)
+    field_of_view = np.squeeze(np.uint(np.expand_dims(left_boundary, axis=1) + np.arange(expanded_kernel_width) - 1))
+
+    # Assign weight to each pixel in the field of view. A matrix whos horizontal dim is the output pixels and the
+    # vertical dim is a list of weights matching to the pixel in the field of view (that are specified in
+    # 'field_of_view')
+    weights = fixed_kernel(1.0 * np.expand_dims(match_coordinates, axis=1) - field_of_view - 1)
+
+    # Normalize weights to sum up to 1. be careful from dividing by 0
+    sum_weights = np.sum(weights, axis=1)
+    sum_weights[sum_weights == 0] = 1.0
+    weights = 1.0 * weights / np.expand_dims(sum_weights, axis=1)
+
+    # We use this mirror structure as a trick for reflection padding at the boundaries
+    mirror = np.uint(np.concatenate((np.arange(in_length), np.arange(in_length - 1, -1, step=-1))))
+    field_of_view = mirror[np.mod(field_of_view, mirror.shape[0])]
+
+    # Get rid of  weights and pixel positions that are of zero weight
+    non_zero_out_pixels = np.nonzero(np.any(weights, axis=0))
+    weights = np.squeeze(weights[:, non_zero_out_pixels])
+    field_of_view = np.squeeze(field_of_view[:, non_zero_out_pixels])
+
+    # Final products are the relative positions and the matching weights, both are output_size X fixed_kernel_size
+    return weights, field_of_view
+
+
+def resize_along_dim(im, dim, weights, field_of_view):
+    # To be able to act on each dim, we swap so that dim 0 is the wanted dim to resize
+    tmp_im = np.swapaxes(im, dim, 0)
+
+    # We add singleton dimensions to the weight matrix so we can multiply it with the big tensor we get for
+    # tmp_im[field_of_view.T], (bsxfun style)
+    weights = np.reshape(weights.T, list(weights.T.shape) + (np.ndim(im) - 1) * [1])
+
+    # This is a bit of a complicated multiplication: tmp_im[field_of_view.T] is a tensor of order image_dims+1.
+    # for each pixel in the output-image it matches the positions the influence it from the input image (along 1 dim
+    # only, this is why it only adds 1 dim to the shape). We then multiply, for each pixel, its set of positions with
+    # the matching set of weights. we do this by this big tensor element-wise multiplication (MATLAB bsxfun style:
+    # matching dims are multiplied element-wise while singletons mean that the matching dim is all multiplied by the
+    # same number
+    tmp_out_im = np.sum(tmp_im[field_of_view.T] * weights, axis=0)
+
+    # Finally we swap back the axes to the original order
+    return np.swapaxes(tmp_out_im, dim, 0)
+
+
+def numeric_kernel(im, kernel, scale_factor, output_shape, kernel_shift_flag):
+    # See kernel_shift function to understand what this is
+    if kernel_shift_flag:
+        kernel = kernel_shift(kernel, scale_factor)
+
+    # First run a correlation (convolution with flipped kernel)
+    out_im = np.zeros_like(im)
+    for channel in range(np.ndim(im)):
+        out_im[:, :, channel] = filters.correlate(im[:, :, channel], kernel)
+
+    # Then subsample and return
+    return out_im[np.round(np.linspace(0, im.shape[0] - 1 / scale_factor[0], output_shape[0])).astype(int)[:, None],
+                  np.round(np.linspace(0, im.shape[1] - 1 / scale_factor[1], output_shape[1])).astype(int), :]
+
+
+def kernel_shift(kernel, sf):
+    # There are two reasons for shifting the kernel:
+    # 1. Center of mass is not in the center of the kernel which creates ambiguity. There is no possible way to know
+    #    the degradation process included shifting so we always assume center of mass is center of the kernel.
+    # 2. We further shift kernel center so that top left result pixel corresponds to the middle of the sfXsf first
+    #    pixels. Default is for odd size to be in the middle of the first pixel and for even sized kernel to be at the
+    #    top left corner of the first pixel. that is why different shift size needed between od and even size.
+    # Given that these two conditions are fulfilled, we are happy and aligned, the way to test it is as follows:
+    # The input image, when interpolated (regular bicubic) is exactly aligned with ground truth.
+
+    # First calculate the current center of mass for the kernel
+    current_center_of_mass = measurements.center_of_mass(kernel)
+
+    # The second ("+ 0.5 * ....") is for applying condition 2 from the comments above
+    wanted_center_of_mass = np.array(kernel.shape) / 2 + 0.5 * (sf - (kernel.shape[0] % 2))
+
+    # Define the shift vector for the kernel shifting (x,y)
+    shift_vec = wanted_center_of_mass - current_center_of_mass
+
+    # Before applying the shift, we first pad the kernel so that nothing is lost due to the shift
+    # (biggest shift among dims + 1 for safety)
+    kernel = np.pad(kernel, np.int(np.ceil(np.max(shift_vec))) + 1, 'constant')
+
+    # Finally shift the kernel and return
+    return interpolation.shift(kernel, shift_vec)
+
+  import glob
+
+import torch
+import torchvision
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+# import skvideo.io
+import os
+import sys
+import torch
+import argparse
+import numpy as np
+from torchvision.datasets import MNIST
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib
+matplotlib.use('agg')
+
+def prepare_hazy_image(file_name):
+    img_pil = crop_image(get_image(file_name, -1)[0], d=32)
+    return pil_to_np(img_pil)
+
+def prepare_gt_img(file_name, SOTS=True):
+    if SOTS:
+        img_pil = crop_image(crop_a_image(get_image(file_name, -1)[0], d=10), d=32)
+    else:
+        img_pil = crop_image(get_image(file_name, -1)[0], d=32)
+
+    return pil_to_np(img_pil)
+
+def crop_a_image(img, d=10):
+    bbox = [
+        int((d)),
+        int((d)),
+        int((img.size[0] - d)),
+        int((img.size[1] - d)),
+    ]
+    img_cropped = img.crop(bbox)
+    return img_cropped
+
+def crop_image(img, d=32):
+    """
+    Make dimensions divisible by d
+    :param pil img:
+    :param d:
+    :return:
+    """
+
+    new_size = (img.size[0] - img.size[0] % d,
+                img.size[1] - img.size[1] % d)
+
+    bbox = [
+        int((img.size[0] - new_size[0]) / 2),
+        int((img.size[1] - new_size[1]) / 2),
+        int((img.size[0] + new_size[0]) / 2),
+        int((img.size[1] + new_size[1]) / 2),
+    ]
+
+    img_cropped = img.crop(bbox)
+    return img_cropped
+
+
+def crop_np_image(img_np, d=32):
+    return torch_to_np(crop_torch_image(np_to_torch(img_np), d))
+
+
+def crop_torch_image(img, d=32):
+    """
+    Make dimensions divisible by d
+    image is [1, 3, W, H] or [3, W, H]
+    :param pil img:
+    :param d:
+    :return:
+    """
+    new_size = (img.shape[-2] - img.shape[-2] % d,
+                img.shape[-1] - img.shape[-1] % d)
+    pad = ((img.shape[-2] - new_size[-2]) // 2, (img.shape[-1] - new_size[-1]) // 2)
+
+    if len(img.shape) == 4:
+        return img[:, :, pad[-2]: pad[-2] + new_size[-2], pad[-1]: pad[-1] + new_size[-1]]
+    assert len(img.shape) == 3
+    return img[:, pad[-2]: pad[-2] + new_size[-2], pad[-1]: pad[-1] + new_size[-1]]
+
+
+def get_params(opt_over, net, net_input, downsampler=None):
+    """
+    Returns parameters that we want to optimize over.
+    :param opt_over: comma separated list, e.g. "net,input" or "net"
+    :param net: network
+    :param net_input: torch.Tensor that stores input `z`
+    :param downsampler:
+    :return:
+    """
+
+    opt_over_list = opt_over.split(',')
+    params = []
+
+    for opt in opt_over_list:
+
+        if opt == 'net':
+            params += [x for x in net.parameters()]
+        elif opt == 'down':
+            assert downsampler is not None
+            params = [x for x in downsampler.parameters()]
+        elif opt == 'input':
+            net_input.requires_grad = True
+            params += [net_input]
+        else:
+            assert False, 'what is it?'
+
+    return params
+
+
+def get_image_grid(images_np, nrow=8):
+    """
+    Creates a grid from a list of images by concatenating them.
+    :param images_np:
+    :param nrow:
+    :return:
+    """
+    images_torch = [torch.from_numpy(x).type(torch.FloatTensor) for x in images_np]
+    torch_grid = torchvision.utils.make_grid(images_torch, nrow)
+
+    return torch_grid.numpy()
+
+
+def plot_image_grid(name, images_np, interpolation='lanczos', output_path="output/"):
+    """
+    Draws images in a grid
+    Args:
+        images_np: list of images, each image is np.array of size 3xHxW or 1xHxW
+        nrow: how many images will be in one row
+        interpolation: interpolation used in plt.imshow
+    """
+    assert len(images_np) == 2
+    n_channels = max(x.shape[0] for x in images_np)
+    assert (n_channels == 3) or (n_channels == 1), "images should have 1 or 3 channels"
+
+    images_np = [x if (x.shape[0] == n_channels) else np.concatenate([x, x, x], axis=0) for x in images_np]
+
+    grid = get_image_grid(images_np, 2)
+
+    if images_np[0].shape[0] == 1:
+        plt.imshow(grid[0], cmap='gray', interpolation=interpolation)
+    else:
+        plt.imshow(grid.transpose(1, 2, 0), interpolation=interpolation)
+
+    plt.savefig(output_path + "{}.png".format(name))
+
+
+def save_image(name, image_np, output_path="output/new_nyu/normal/"):
+    p = np_to_pil(image_np)
+    p.save(output_path + "{}.jpg".format(name))
+#    p.save(output_path + "{}.jpg".format(name))
+
+
+def video_to_images(file_name, name):
+    video = prepare_video(file_name)
+    for i, f in enumerate(video):
+        save_image(name + "_{0:03d}".format(i), f)
+
+def images_to_video(images_dir ,name, gray=True):
+    num = len(glob.glob(images_dir +"/*.jpg"))
+    c = []
+    for i in range(num):
+        if gray:
+            img = prepare_gray_image(images_dir + "/"+  name +"_{}.jpg".format(i))
+        else:
+            img = prepare_image(images_dir + "/"+name+"_{}.jpg".format(i))
+        print(img.shape)
+        c.append(img)
+    save_video(name, np.array(c))
+
+def save_heatmap(name, image_np):
+    cmap = plt.get_cmap('jet')
+
+    rgba_img = cmap(image_np)
+    rgb_img = np.delete(rgba_img, 3, 2)
+    save_image(name, rgb_img.transpose(2, 0, 1))
+
+
+def save_graph(name, graph_list, output_path="output/"):
+    plt.clf()
+    plt.plot(graph_list)
+    plt.savefig(output_path + name + ".png")
+
+
+def create_augmentations(np_image):
+    """
+    convention: original, left, upside-down, right, rot1, rot2, rot3
+    :param np_image:
+    :return:
+    """
+    aug = [np_image.copy(), np.rot90(np_image, 1, (1, 2)).copy(),
+           np.rot90(np_image, 2, (1, 2)).copy(), np.rot90(np_image, 3, (1, 2)).copy()]
+    flipped = np_image[:,::-1, :].copy()
+    aug += [flipped.copy(), np.rot90(flipped, 1, (1, 2)).copy(), np.rot90(flipped, 2, (1, 2)).copy(), np.rot90(flipped, 3, (1, 2)).copy()]
+    return aug
+
+
+def create_video_augmentations(np_video):
+    """
+        convention: original, left, upside-down, right, rot1, rot2, rot3
+        :param np_video:
+        :return:
+        """
+    aug = [np_video.copy(), np.rot90(np_video, 1, (2, 3)).copy(),
+           np.rot90(np_video, 2, (2, 3)).copy(), np.rot90(np_video, 3, (2, 3)).copy()]
+    flipped = np_video[:, :, ::-1, :].copy()
+    aug += [flipped.copy(), np.rot90(flipped, 1, (2, 3)).copy(), np.rot90(flipped, 2, (2, 3)).copy(),
+            np.rot90(flipped, 3, (2, 3)).copy()]
+    return aug
+
+
+def save_graphs(name, graph_dict, output_path="output/"):
+    """
+    :param name:
+    :param dict graph_dict: a dict from the name of the list to the list itself.
+    :return:
+    """
+    plt.clf()
+    fig, ax = plt.subplots()
+    for k, v in graph_dict.items():
+        ax.plot(v, label=k)
+        # ax.semilogy(v, label=k)
+    ax.set_xlabel('iterations')
+    # ax.set_ylabel(name)
+    ax.set_ylabel('MSE-loss')
+    # ax.set_ylabel('PSNR')
+    plt.legend()
+    plt.savefig(output_path + name + ".png")
+
+
+def load(path):
+    """Load PIL image."""
+    img = Image.open(path)
+    return img
+
+
+def get_image(path, imsize=-1):
+    """Load an image and resize to a cpecific size.
+    Args:
+        path: path to image
+        imsize: tuple or scalar with dimensions; -1 for `no resize`
+    """
+    img = load(path)
+    if isinstance(imsize, int):
+        imsize = (imsize, imsize)
+
+    if imsize[0] != -1 and img.size != imsize:
+        if imsize[0] > img.size[0]:
+            img = img.resize(imsize, Image.BICUBIC)
+        else:
+            img = img.resize(imsize, Image.ANTIALIAS)
+
+    img_np = pil_to_np(img)
+#    3*460*620
+#    print(np.shape(img_np))
+
+    return img, img_np
+
+def prepare_gt(file_name):
+    """
+    loads makes it divisible
+    :param file_name:
+    :return: the numpy representation of the image
+    """
+    img = get_image(file_name, -1)
+#    print(img[0].size)
+
+    img_pil = img[0].crop([10, 10, img[0].size[0]-10, img[0].size[1]-10])
+
+    img_pil = crop_image(img_pil, d=32)
+
+#    img_pil = get_image(file_name, -1)[0]
+#    print(img_pil.size)
+    return pil_to_np(img_pil)
+
+
+def prepare_image(file_name):
+    """
+    loads makes it divisible
+    :param file_name:
+    :return: the numpy representation of the image
+    """
+    img = get_image(file_name, -1)
+#    print(img[0].size)
+#    img_pil = img[0]
+    img_pil = crop_image(img[0], d=32)
+#    img_pil = get_image(file_name, -1)[0]
+#    print(img_pil.size)
+    return pil_to_np(img_pil)
+
+
+# def prepare_video(file_name, folder="output/"):
+#     data = skvideo.io.vread(folder + file_name)
+#     return crop_torch_image(data.transpose(0, 3, 1, 2).astype(np.float32) / 255.)[:35]
+#
+#
+# def save_video(name, video_np, output_path="output/"):
+#     outputdata = video_np * 255
+#     outputdata = outputdata.astype(np.uint8)
+#     skvideo.io.vwrite(output_path + "{}.mp4".format(name), outputdata.transpose(0, 2, 3, 1))
+
+
+def prepare_gray_image(file_name):
+    img = prepare_image(file_name)
+    return np.array([np.mean(img, axis=0)])
+
+
+def pil_to_np(img_PIL, with_transpose=True):
+    """
+    Converts image in PIL format to np.array.
+    From W x H x C [0...255] to C x W x H [0..1]
+    """
+    ar = np.array(img_PIL)
+    if len(ar.shape) == 3 and ar.shape[-1] == 4:
+        ar = ar[:, :, :3]
+        # this is alpha channel
+    if with_transpose:
+        if len(ar.shape) == 3:
+            ar = ar.transpose(2, 0, 1)
+        else:
+            ar = ar[None, ...]
+
+    return ar.astype(np.float32) / 255.
+
+
+def median(img_np_list):
+    """
+    assumes C x W x H [0..1]
+    :param img_np_list:
+    :return:
+    """
+    assert len(img_np_list) > 0
+    l = len(img_np_list)
+    shape = img_np_list[0].shape
+    result = np.zeros(shape)
+    for c in range(shape[0]):
+        for w in range(shape[1]):
+            for h in range(shape[2]):
+                result[c, w, h] = sorted(i[c, w, h] for i in img_np_list)[l//2]
+    return result
+
+
+def average(img_np_list):
+    """
+    assumes C x W x H [0..1]
+    :param img_np_list:
+    :return:
+    """
+    assert len(img_np_list) > 0
+    l = len(img_np_list)
+    shape = img_np_list[0].shape
+    result = np.zeros(shape)
+    for i in img_np_list:
+        result += i
+    return result / l
+
+
+def np_to_pil(img_np):
+    """
+    Converts image in np.array format to PIL image.
+    From C x W x H [0..1] to  W x H x C [0...255]
+    :param img_np:
+    :return:
+    """
+    ar = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+
+    if img_np.shape[0] == 1:
+        ar = ar[0]
+    else:
+        assert img_np.shape[0] == 3, img_np.shape
+        ar = ar.transpose(1, 2, 0)
+
+    return Image.fromarray(ar)
+
+
+def np_to_torch(img_np):
+    """
+    Converts image in numpy.array to torch.Tensor.
+    From C x W x H [0..1] to  C x W x H [0..1]
+    :param img_np:
+    :return:
+    """
+    return torch.from_numpy(img_np)[None, :]
+
+
+def torch_to_np(img_var):
+    """
+    Converts an image in torch.Tensor format to np.array.
+    From 1 x C x W x H [0..1] to  C x W x H [0..1]
+    :param img_var:
+    :return:
+    """
+    return img_var.detach().cpu().numpy()[0]
+import numpy as np
+import torch
+import torch.nn as nn
+#from utils.image_io import *
+#from utils.imresize import imresize
+
+class Downsampler(nn.Module):
+    """
+        http://www.realitypixels.com/turk/computergraphics/ResamplingFilters.pdf
+    """
+
+    def __init__(self, n_planes, factor, kernel_type, phase=0, kernel_width=None, support=None, sigma=None,
+                 preserve_size=False):
+        """
+        :param n_planes:
+        :param factor:
+        :param kernel_type:
+        :param float phase:
+        :param kernel_width:
+        :param support:
+        :param sigma:
+        :param preserve_size:
+        """
+        super(Downsampler, self).__init__()
+
+        assert phase in [0, 0.5], 'phase should be 0 or 0.5'
+
+        if kernel_type == 'lanczos2':
+            support = 2
+            kernel_width = 4 * factor + 1
+            kernel_type_ = 'lanczos'
+
+        elif kernel_type == 'lanczos3':
+            support = 3
+            kernel_width = 6 * factor + 1
+            kernel_type_ = 'lanczos'
+
+        elif kernel_type == 'gauss12':
+            kernel_width = 7
+            sigma = 1 / 2
+            kernel_type_ = 'gauss'
+
+        elif kernel_type == 'gauss1sq2':
+            kernel_width = 9
+            sigma = 1. / np.sqrt(2)
+            kernel_type_ = 'gauss'
+
+        elif kernel_type in ['lanczos', 'gauss', 'box']:
+            kernel_type_ = kernel_type
+
+        else:
+            assert False, 'wrong name kernel'
+
+        # note that `kernel width` will be different to actual size for phase = 1/2
+        self.kernel = get_kernel(factor, kernel_type_, phase, kernel_width, support=support, sigma=sigma)
+
+        downsampler = nn.Conv2d(n_planes, n_planes, kernel_size=self.kernel.shape, stride=factor, padding=0)
+        downsampler.weight.data[:] = 0
+        downsampler.bias.data[:] = 0
+
+        kernel_torch = torch.from_numpy(self.kernel)
+        for i in range(n_planes):
+            downsampler.weight.data[i, i] = kernel_torch
+
+        self.downsampler_ = downsampler
+
+        if preserve_size:
+
+            if self.kernel.shape[0] % 2 == 1:
+                pad = int((self.kernel.shape[0] - 1) / 2.)
+            else:
+                pad = int((self.kernel.shape[0] - factor) / 2.)
+
+            self.padding = nn.ReplicationPad2d(pad)
+
+        self.preserve_size = preserve_size
+
+    def forward(self, input):
+        if self.preserve_size:
+            x = self.padding(input)
+        else:
+            x = input
+        self.x = x
+        return self.downsampler_(x)
+
+
+def get_kernel(factor, kernel_type, phase, kernel_width, support=None, sigma=None):
+    assert kernel_type in ['lanczos', 'gauss', 'box']
+
+    # factor  = float(factor)
+    if phase == 0.5 and kernel_type != 'box':
+        kernel = np.zeros([kernel_width - 1, kernel_width - 1])
+    else:
+        kernel = np.zeros([kernel_width, kernel_width])
+
+    if kernel_type == 'box':
+        assert phase == 0.5, 'Box filter is always half-phased'
+        kernel[:] = 1. / (kernel_width * kernel_width)
+
+    elif kernel_type == 'gauss':
+        assert sigma, 'sigma is not specified'
+        assert phase != 0.5, 'phase 1/2 for gauss not implemented'
+
+        center = (kernel_width + 1.) / 2.
+        print(center, kernel_width)
+        sigma_sq = sigma * sigma
+
+        for i in range(1, kernel.shape[0] + 1):
+            for j in range(1, kernel.shape[1] + 1):
+                di = (i - center) / 2.
+                dj = (j - center) / 2.
+                kernel[i - 1][j - 1] = np.exp(-(di * di + dj * dj) / (2 * sigma_sq))
+                kernel[i - 1][j - 1] = kernel[i - 1][j - 1] / (2. * np.pi * sigma_sq)
+    elif kernel_type == 'lanczos':
+        assert support, 'support is not specified'
+        center = (kernel_width + 1) / 2.
+
+        for i in range(1, kernel.shape[0] + 1):
+            for j in range(1, kernel.shape[1] + 1):
+
+                if phase == 0.5:
+                    di = abs(i + 0.5 - center) / factor
+                    dj = abs(j + 0.5 - center) / factor
+                else:
+                    di = abs(i - center) / factor
+                    dj = abs(j - center) / factor
+
+                pi_sq = np.pi * np.pi
+
+                val = 1
+                if di != 0:
+                    val = val * support * np.sin(np.pi * di) * np.sin(np.pi * di / support)
+                    val = val / (np.pi * np.pi * di * di)
+
+                if dj != 0:
+                    val = val * support * np.sin(np.pi * dj) * np.sin(np.pi * dj / support)
+                    val = val / (np.pi * np.pi * dj * dj)
+
+                kernel[i - 1][j - 1] = val
+
+
+    else:
+        assert False, 'wrong method name'
+
+    kernel /= kernel.sum()
+
+    return kernel
+
+
+def get_downsampled(image, downsample_factors):
+    """
+    image is of type np.array
+    downsampling_factor should be integer - e.g. 2
+    """
+    # TODO: move kernel type to args
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
+    data_type = torch.cuda.FloatTensor
+    image_torch = np_to_torch(image).type(data_type)
+    downsampled_images = [image_torch]
+    for i in downsample_factors:
+        downsampler = Downsampler(n_planes=image_torch.shape[1], factor=i,
+                                  kernel_type='lanczos2', phase=0.5, preserve_size=True).cuda()
+        downsampled_images.append(downsampler(image_torch))
+
+    return [torch_to_np(crop_torch_image(image, d=32)) for image in downsampled_images]
+
+
+
+def get_imresize_downsampled(image, downsampling_factor, downsampling_number):
+    """
+    image is of type np.array
+    downsampling_factor should be integer - e.g. 0.5
+    """
+    # TODO: move kernel type to args
+    downsampled_images = [image]
+    for i in range(1, downsampling_number + 1):
+        im = np.clip(imresize(image.transpose(1, 2, 0), scale_factor=(1 - (downsampling_factor * downsampling_number))).transpose(2,0,1), 0,1)
+        downsampled_images.append(pil_to_np(crop_image(np_to_pil(im), d=32)))
+
+    return downsampled_images
+  import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+#from .downsampler import Downsampler
+#from utils.image_io import torch_to_np
+
+
+def weights_init(m):
+    """ This is used to initialize weights of any network """
+    class_name = m.__class__.__name__
+    if class_name.find('Conv') != -1:
+        nn.init.xavier_normal(m.weight, 1.0)
+        if hasattr(m.bias, 'data'):
+            m.bias.data.fill_(0)
+    elif class_name.find('BatchNorm2d') != -1:
+        m.weight.data.normal_(1.0, 0.02)
+        m.bias.data.fill_(0)
+
+
+class Ratio(nn.Module):
+    def __init__(self):
+        super(Ratio, self).__init__()
+        self.multp = torch.autograd.Variable(torch.tensor(np.random.uniform(0, 1)),
+                                             requires_grad=True).type(torch.cuda.FloatTensor)
+        self.sig = nn.Sigmoid()
+
+    def forward(self):
+        return self.sig(self.multp)
+
+
+class VectorRatio(nn.Module):
+    def __init__(self, frames_number):
+        super(VectorRatio, self).__init__()
+        self.multp = torch.autograd.Variable(
+            torch.tensor(np.random.uniform(0, 1, frames_number)).reshape([frames_number, 1, 1, 1])).type(torch.cuda.FloatTensor)
+        self.sig = nn.Sigmoid()
+
+    def forward(self):
+        return self.sig(self.multp)
+
+
+class Concat(nn.Module):
+    def __init__(self, dim, *args):
+        super(Concat, self).__init__()
+        self.dim = dim
+
+        for idx, module_ in enumerate(args):
+            self.add_module(str(idx), module_)
+
+    def forward(self, input_):
+        inputs = []
+        for module_ in self._modules.values():
+            inputs.append(module_(input_))
+
+        inputs_shapes2 = [x.shape[2] for x in inputs]
+        inputs_shapes3 = [x.shape[3] for x in inputs]
+
+        if np.all(np.array(inputs_shapes2) == min(inputs_shapes2)) and np.all(
+                        np.array(inputs_shapes3) == min(inputs_shapes3)):
+            inputs_ = inputs
+        else:
+            target_shape2 = min(inputs_shapes2)
+            target_shape3 = min(inputs_shapes3)
+
+            inputs_ = []
+            for inp in inputs:
+                diff2 = (inp.size(2) - target_shape2) // 2
+                diff3 = (inp.size(3) - target_shape3) // 2
+                inputs_.append(inp[:, :, diff2: diff2 + target_shape2, diff3:diff3 + target_shape3])
+
+        return torch.cat(inputs_, dim=self.dim)
+
+    def __len__(self):
+        return len(self._modules)
+
+
+class GenNoise(nn.Module):
+    def __init__(self, dim2):
+        super(GenNoise, self).__init__()
+        self.dim2 = dim2
+
+    def forward(self, x):
+        a = list(x.size())
+        a[1] = self.dim2
+
+        b = torch.zeros(a).type_as(x.data)
+        b.normal_()
+
+        x = torch.autograd.Variable(b)
+
+        return x
+
+
+class Swish(nn.Module):
+    """
+        https://arxiv.org/abs/1710.05941
+        The hype was so huge that I could not help but try it
+    """
+
+    def __init__(self):
+        super(Swish, self).__init__()
+        self.s = nn.Sigmoid()
+
+    def forward(self, x):
+        return x * self.s(x)
+
+
+def act(act_fun='LeakyReLU'):
+    """
+        Either string defining an activation function or module (e.g. nn.ReLU)
+    """
+    if isinstance(act_fun, str):
+        if act_fun == 'LeakyReLU':
+            return nn.LeakyReLU(0.2, inplace=True)
+        elif act_fun == 'Swish':
+            return Swish()
+        elif act_fun == 'ELU':
+            return nn.ELU()
+        elif act_fun == 'none':
+            return nn.Sequential()
+        else:
+            assert False
+    else:
+        return act_fun()
+
+
+import torch
+import torch.nn as nn
+
+
+def bn(num_features):
+    return nn.BatchNorm2d(num_features)
+
+
+def conv(in_f, out_f, kernel_size, stride=1, bias=True, pad='zero', downsample_mode='stride'):
+    downsampler = None
+    if stride != 1 and downsample_mode != 'stride':
+
+        if downsample_mode == 'avg':
+            downsampler = nn.AvgPool2d(stride, stride)
+        elif downsample_mode == 'max':
+            downsampler = nn.MaxPool2d(stride, stride)
+        elif downsample_mode in ['lanczos2', 'lanczos3']:
+            downsampler = Downsampler(n_planes=out_f, factor=stride, kernel_type=downsample_mode, phase=0.5,
+                                      preserve_size=True)
+        stride = 1
+
+    padder = None
+    to_pad = int((kernel_size - 1) / 2)
+    if pad == 'reflection':
+        padder = nn.ReflectionPad2d(to_pad)
+        to_pad = 0
+
+    convolver = nn.Conv2d(in_f, out_f, kernel_size, stride, padding=to_pad, bias=bias)
+
+    layers = [x for x in [padder, convolver, downsampler] if x is not None]
+    return nn.Sequential(*layers)
+
+
+
+
+class FixedBlurLayer(nn.Module):
+    def __init__(self, kernel):
+        super(FixedBlurLayer, self).__init__()
+        self.kernel = kernel
+        to_pad_x = int((self.kernel.shape[0] - 1) / 2)
+        to_pad_y = int((self.kernel.shape[1] - 1) / 2)
+        self.pad = nn.ReflectionPad2d((to_pad_x, to_pad_x, to_pad_y, to_pad_y))
+        self.mask_np = np.zeros(shape=(1, 3, self.kernel.shape[0], self.kernel.shape[1]))
+        self.mask_np[0, 0, :, :] = self.kernel
+        self.mask_np[0, 1, :, :] = self.kernel
+        self.mask_np[0, 2, :, :] = self.kernel
+        self.mask = nn.Parameter(data=torch.cuda.FloatTensor(self.mask_np), requires_grad=False)
+
+    def forward(self, x):
+        return F.conv2d(self.pad(x), self.mask)
+
+
+class VarianceLayer(nn.Module):
+    # TODO: make it pad-able
+    def __init__(self, patch_size=5, channels=1):
+        self.patch_size = patch_size
+        super(VarianceLayer, self).__init__()
+        mean_mask = np.ones((channels, channels, patch_size, patch_size)) / (patch_size * patch_size)
+        self.mean_mask = nn.Parameter(data=torch.cuda.FloatTensor(mean_mask), requires_grad=False)
+        mask = np.zeros((channels, channels, patch_size, patch_size))
+        mask[:, :, patch_size // 2, patch_size // 2] = 1.
+        self.ones_mask = nn.Parameter(data=torch.cuda.FloatTensor(mask), requires_grad=False)
+
+    def forward(self, x):
+        Ex_E = F.conv2d(x, self.ones_mask) - F.conv2d(x, self.mean_mask)
+        return F.conv2d((Ex_E) ** 2, self.mean_mask)
+
+
+class CovarianceLayer(nn.Module):
+    def __init__(self, patch_size=5, channels=1):
+        self.patch_size = patch_size
+        super(CovarianceLayer, self).__init__()
+        mean_mask = np.ones((channels, channels, patch_size, patch_size)) / (patch_size * patch_size)
+        self.mean_mask = nn.Parameter(data=torch.cuda.FloatTensor(mean_mask), requires_grad=False)
+        mask = np.zeros((channels, channels, patch_size, patch_size))
+        mask[:, :, patch_size // 2, patch_size // 2] = 1.
+        self.ones_mask = nn.Parameter(data=torch.cuda.FloatTensor(mask), requires_grad=False)
+
+    def forward(self, x, y):
+        return F.conv2d((F.conv2d(x, self.ones_mask) - F.conv2d(x, self.mean_mask)) *
+                        (F.conv2d(y, self.ones_mask) - F.conv2d(y, self.mean_mask)), self.mean_mask)
+
+class GrayscaleLayer(nn.Module):
+    def __init__(self):
+        super(GrayscaleLayer, self).__init__()
+
+    def forward(self, x):
+        return torch.mean(x, 1, keepdim=True)
+
+
+
+def add_module(self, module_):
+    self.add_module(str(len(self) + 1), module_)
+
+
+torch.nn.Module.add = add_module
+  import torch
+from torch import nn
+import numpy as np
+from torch.nn import functional
+class StdLoss(nn.Module):
+    def __init__(self):
+        """
+        Loss on the variance of the image.
+        Works in the grayscale.
+        If the image is smooth, gets zero
+        """
+        super(StdLoss, self).__init__()
+        blur = (1 / 25) * np.ones((5, 5))
+        blur = blur.reshape(1, 1, blur.shape[0], blur.shape[1])
+        self.mse = nn.MSELoss()
+        self.blur = nn.Parameter(data=torch.cuda.FloatTensor(blur), requires_grad=False)
+        image = np.zeros((5, 5))
+        image[2, 2] = 1
+        image = image.reshape(1, 1, image.shape[0], image.shape[1])
+        self.image = nn.Parameter(data=torch.cuda.FloatTensor(image), requires_grad=False)
+        self.gray_scale = GrayscaleLayer()
+
+    def forward(self, x):
+        x = self.gray_scale(x)
+        return self.mse(functional.conv2d(x, self.image), functional.conv2d(x, self.blur))
+
+
+class ExclusionLoss(nn.Module):
+
+    def __init__(self, level=3):
+        """
+        Loss on the gradient. based on:
+        http://openaccess.thecvf.com/content_cvpr_2018/papers/Zhang_Single_Image_Reflection_CVPR_2018_paper.pdf
+        """
+        super(ExclusionLoss, self).__init__()
+        self.level = level
+        self.avg_pool = torch.nn.AvgPool2d(2, stride=2).type(torch.cuda.FloatTensor)
+        self.sigmoid = nn.Sigmoid().type(torch.cuda.FloatTensor)
+
+    def get_gradients(self, img1, img2):
+        gradx_loss = []
+        grady_loss = []
+
+        for l in range(self.level):
+            gradx1, grady1 = self.compute_gradient(img1)
+            gradx2, grady2 = self.compute_gradient(img2)
+            # alphax = 2.0 * torch.mean(torch.abs(gradx1)) / torch.mean(torch.abs(gradx2))
+            # alphay = 2.0 * torch.mean(torch.abs(grady1)) / torch.mean(torch.abs(grady2))
+            alphay = 1
+            alphax = 1
+            gradx1_s = (self.sigmoid(gradx1) * 2) - 1
+            grady1_s = (self.sigmoid(grady1) * 2) - 1
+            gradx2_s = (self.sigmoid(gradx2 * alphax) * 2) - 1
+            grady2_s = (self.sigmoid(grady2 * alphay) * 2) - 1
+
+            # gradx_loss.append(torch.mean(((gradx1_s ** 2) * (gradx2_s ** 2))) ** 0.25)
+            # grady_loss.append(torch.mean(((grady1_s ** 2) * (grady2_s ** 2))) ** 0.25)
+            gradx_loss += self._all_comb(gradx1_s, gradx2_s)
+            grady_loss += self._all_comb(grady1_s, grady2_s)
+            img1 = self.avg_pool(img1)
+            img2 = self.avg_pool(img2)
+        return gradx_loss, grady_loss
+
+    def _all_comb(self, grad1_s, grad2_s):
+        v = []
+        for i in range(3):
+            for j in range(3):
+                v.append(torch.mean(((grad1_s[:, j, :, :] ** 2) * (grad2_s[:, i, :, :] ** 2))) ** 0.25)
+        return v
+
+    def forward(self, img1, img2):
+        gradx_loss, grady_loss = self.get_gradients(img1, img2)
+        loss_gradxy = sum(gradx_loss) / (self.level * 9) + sum(grady_loss) / (self.level * 9)
+        return loss_gradxy / 2.0
+
+    def compute_gradient(self, img):
+        gradx = img[:, :, 1:, :] - img[:, :, :-1, :]
+        grady = img[:, :, :, 1:] - img[:, :, :, :-1]
+        return gradx, grady
+
+
+class ExtendedL1Loss(nn.Module):
+    """
+    also pays attention to the mask, to be relative to its size
+    """
+    def __init__(self):
+        super(ExtendedL1Loss, self).__init__()
+        self.l1 = nn.L1Loss().cuda()
+
+    def forward(self, a, b, mask):
+        normalizer = self.l1(mask, torch.zeros(mask.shape).cuda())
+        # if normalizer < 0.1:
+        #     normalizer = 0.1
+        c = self.l1(mask * a, mask * b) / normalizer
+        return c
+
+
+class NonBlurryLoss(nn.Module):
+    def __init__(self):
+        """
+        Loss on the distance to 0.5
+        """
+        super(NonBlurryLoss, self).__init__()
+        self.mse = nn.MSELoss()
+
+    def forward(self, x):
+        return 1 - self.mse(x, torch.ones_like(x) * 0.5)
+
+
+class GrayscaleLoss(nn.Module):
+    def __init__(self):
+        super(GrayscaleLoss, self).__init__()
+        self.gray_scale = GrayscaleLayer()
+        self.mse = nn.MSELoss().cuda()
+
+    def forward(self, x, y):
+        x_g = self.gray_scale(x)
+        y_g = self.gray_scale(y)
+        return self.mse(x_g, y_g)
+
+
+class GrayLoss(nn.Module):
+    def __init__(self):
+        super(GrayLoss, self).__init__()
+        self.l1 = nn.L1Loss().cuda()
+
+    def forward(self, x):
+        y = torch.ones_like(x) / 2.
+        return 1 / self.l1(x, y)
+
+
+class GradientLoss(nn.Module):
+    """
+    L1 loss on the gradient of the picture
+    """
+    def __init__(self):
+        super(GradientLoss, self).__init__()
+
+    def forward(self, a):
+        gradient_a_x = torch.abs(a[:, :, :, :-1] - a[:, :, :, 1:])
+        gradient_a_y = torch.abs(a[:, :, :-1, :] - a[:, :, 1:, :])
+        return torch.mean(gradient_a_x) + torch.mean(gradient_a_y)
+
+
+class YIQGNGCLoss(nn.Module):
+    def __init__(self, shape=5):
+        super(YIQGNGCLoss, self).__init__()
+        self.shape = shape
+        self.var = VarianceLayer(self.shape, channels=1)
+        self.covar = CovarianceLayer(self.shape, channels=1)
+
+    def forward(self, x, y):
+        if x.shape[1] == 3:
+            x_g = rgb_to_yiq(x)[:, :1, :, :]  # take the Y part
+            y_g = rgb_to_yiq(y)[:, :1, :, :]  # take the Y part
+        else:
+            assert x.shape[1] == 1
+            x_g = x  # take the Y part
+            y_g = y  # take the Y part
+        c = torch.mean(self.covar(x_g, y_g) ** 2)
+        vv = torch.mean(self.var(x_g) * self.var(y_g))
+        return c / vv
+  def get_noise(input_depth, method, spatial_size, noise_type='u', var=1. / 100):
+    """
+    Returns a pytorch.Tensor of size (1 x `input_depth` x `spatial_size[0]` x `spatial_size[1]`)
+    initialized in a specific way.
+    Args:
+        input_depth: number of channels in the tensor
+        method: `noise` for fillting tensor with noise; `meshgrid` for np.meshgrid
+        spatial_size: spatial size of the tensor to initialize
+        noise_type: 'u' for uniform; 'n' for normal
+        var: a factor, a noise will be multiplicated by. Basically it is standard deviation scaler.
+    """
+    if isinstance(spatial_size, int):
+        spatial_size = (spatial_size, spatial_size)
+    if method == 'noise':
+        shape = [1, input_depth, spatial_size[0], spatial_size[1]]
+        net_input = torch.zeros(shape)
+
+        fill_noise(net_input, noise_type)
+        net_input *= var
+    elif method == 'meshgrid':
+        assert input_depth % 2 == 0
+        X, Y = np.meshgrid(np.arange(0, spatial_size[1]) / float(spatial_size[1] - 1),
+                           np.arange(0, spatial_size[0]) / float(spatial_size[0] - 1))
+        meshgrid = np.concatenate([X[None, :], Y[None, :]] * (input_depth // 2))
+        net_input = np_to_torch(meshgrid)
+    else:
+        assert False
+
+    return net_input
+
+
+def get_video_noise(input_depth, method, temporal_size, spatial_size, noise_type='u', var=1. / 100, type="dependant"):
+    """
+    Returns a pytorch.Tensor of size (frame_number x `input_depth` x `spatial_size[0]` x `spatial_size[1]`)
+    initialized in a specific way.
+    Args:
+        input_depth: number of channels in the tensor
+        method: `noise` for fillting tensor with noise; `meshgrid` for np.meshgrid
+        temporal_size: number of frames
+        spatial_size: spatial size of the tensor to initialize
+        noise_type: 'u' for uniform; 'n' for normal
+        var: a factor, a noise will be multiplicated by. Basically it is standard deviation scaler.
+    """
+    if isinstance(spatial_size, int):
+        spatial_size = (spatial_size, spatial_size)
+    if method == 'noise':
+        all_noise = []
+        for i in range(temporal_size):
+            shape = [input_depth, spatial_size[0], spatial_size[1]]
+            if len(all_noise) > 0:
+                if type == "dependant":
+                    frame = np.random.uniform(0, 1, size=shape)
+                    frame *= var
+                    all_noise.append(all_noise[-1] + frame)
+                elif type == "half_dependant":
+                    frame = np.random.uniform(0, 1, size=shape)
+                    frame *= var
+                    new_noise = (all_noise[-1] + frame)
+                    new_noise[:input_depth // 2,:,:] = (var * 10) * np.random.uniform(0, 1, size=shape)[:input_depth // 2,:,:]
+                    all_noise.append(new_noise)
+            else:
+                frame = np.random.uniform(-0.5, 0.5, size=shape)
+                frame *= (var * 10)
+                all_noise.append(frame)
+        return np_to_torch(np.array(all_noise))[0]
+    elif method == 'meshgrid':
+        assert False
+        assert input_depth % 2 == 0
+        X, Y = np.meshgrid(np.arange(0, spatial_size[1]) / float(spatial_size[1] - 1),
+                           np.arange(0, spatial_size[0]) / float(spatial_size[0] - 1))
+        meshgrid = np.concatenate([X[None, :], Y[None, :]] * (input_depth // 2))
+        net_input = np_to_torch(meshgrid)
+    else:
+        assert False
+
+    return net_input
+
+
+class NoiseNet(nn.Module):
+    def __init__(self, channels=3, kernel_size=5):
+        super(NoiseNet, self).__init__()
+        self.kernel_size = kernel_size
+        self.channels = channels
+        to_pad = int((self.kernel_size - 1) / 2)
+        self.padder = nn.ReflectionPad2d(to_pad).type(torch.cuda.FloatTensor)
+        to_pad = 0
+        self.convolver = nn.Conv2d(channels, channels, self.kernel_size, 1, padding=to_pad, bias=True).type(torch.cuda.FloatTensor)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels, (x.shape, self.channels)
+        first = F.relu(self.convolver(self.padder(x)))
+        second = F.relu(self.convolver(self.padder(first)))
+        third = F.relu(self.convolver(self.padder(second)))
+        assert x.shape == third.shape, (x.shape, third.shape)
+        return third
+
+
+def fill_noise(x, noise_type):
+    """
+    Fills tensor `x` with noise of type `noise_type`.
+    """
+    if noise_type == 'u':
+        x.uniform_(-0.5, 0.5)
+    elif noise_type == 'n':
+        x.normal_()
+    else:
+        assert False
+  def optimize(optimizer_type, parameters, optimization_closure,
+             plot_closure,
+             learning_rate,
+             num_iter,
+             optimization_closure_args,
+             plot_closure_args):
+    """
+    Runs optimization loop.
+    :param optimizer_type: 'LBFGS' of 'adam'
+    :param parameters: list of Tensors to optimize over
+    :param optimization_closure: function, that returns loss variable
+    :param plot_closure: function that plots the loss and other information
+    :param learning_rate: learning rate
+    :param num_iter: number of iterations
+    :param dict optimization_closure_args: the arguments for the optimization closure
+    :param dict plot_closure_args: the arguments for the plot closure
+    :return:
+    """
+    if optimizer_type == 'LBFGS':
+        assert False
+
+    elif optimizer_type == 'adam':
+        print('Starting optimization with ADAM')
+        optimizer = torch.optim.Adam(parameters, lr=learning_rate)
+
+        for j in range(num_iter):
+            optimizer.zero_grad()
+            optimization_results = optimization_closure(j, **optimization_closure_args)
+            if plot_closure:
+                plot_closure(j, *optimization_results, **plot_closure_args)
+            optimizer.step()
+    else:
+        assert False
+
+
+def uneven_optimize(optimizer_type, parameters, optimization_closure,
+                    plot_closure,
+                    learning_rate,
+                    num_iter, step,
+                    optimization_closure_args,
+                    plot_closure_args):
+    """
+    Runs optimization loop.
+    :param optimizer_type: 'LBFGS' of 'adam'
+    :param parameters: list of Tensors to optimize over
+    :param optimization_closure: function, that returns loss variable
+    :param plot_closure: function that plots the loss and other information
+    :param learning_rate: learning rate
+    :param num_iter: number of iterations
+    :param dict optimization_closure_args: the arguments for the optimization closure
+    :param dict plot_closure_args: the arguments for the plot closure
+    :return:
+    """
+    if optimizer_type == 'LBFGS':
+        assert False
+
+    elif optimizer_type == 'adam':
+        print('Starting optimization with ADAM')
+        next_step_optimization_args = None
+        for j in range(num_iter // step):
+            optimizer = torch.optim.Adam(parameters, lr=learning_rate)
+            for i in range(step):
+                optimizer.zero_grad()
+                optimization_results, next_step_optimization_args_temp = \
+                    optimization_closure(j*step + i, next_step_optimization_args, **optimization_closure_args)
+                if plot_closure:
+                    plot_closure(j*step + i, *optimization_results, **plot_closure_args)
+                optimizer.step()
+                if next_step_optimization_args is None:
+                    # step zero
+                    next_step_optimization_args = next_step_optimization_args_temp
+            next_step_optimization_args = next_step_optimization_args_temp
+    else:
+        assert False
+
+def skip(
+        num_input_channels=2, num_output_channels=3, num_channels_down=[16, 32, 64, 128, 128],
+        num_channels_up=[16, 32, 64, 128, 128],
+        num_channels_skip=[4, 4, 4, 4, 4], filter_size_down=3,
+        filter_size_up=3, filter_skip_size=1, need_sigmoid=True, need_bias=True,
+        pad='zero', upsample_mode='nearest', downsample_mode='stride', act_fun='LeakyReLU', need1x1_up=True):
+    """
+    Assembles encoder-decoder with skip connections.
+    Arguments:
+        act_fun: Either string 'LeakyReLU|Swish|ELU|none' or module (e.g. nn.ReLU)
+        pad (string): zero|reflection (default: 'zero')
+        upsample_mode (string): 'nearest|bilinear' (default: 'nearest')
+        downsample_mode (string): 'stride|avg|max|lanczos2' (default: 'stride')
+    """
+    assert len(num_channels_down) == len(num_channels_up) == len(num_channels_skip)
+
+    n_scales = len(num_channels_down)
+
+    if not (isinstance(upsample_mode, list) or isinstance(upsample_mode, tuple)):
+        upsample_mode = [upsample_mode] * n_scales
+
+    if not (isinstance(downsample_mode, list) or isinstance(downsample_mode, tuple)):
+        downsample_mode = [downsample_mode] * n_scales
+
+    if not (isinstance(filter_size_down, list) or isinstance(filter_size_down, tuple)):
+        filter_size_down = [filter_size_down] * n_scales
+
+    if not (isinstance(filter_size_up, list) or isinstance(filter_size_up, tuple)):
+        filter_size_up = [filter_size_up] * n_scales
+
+    last_scale = n_scales - 1
+
+    cur_depth = None
+
+    model = nn.Sequential()
+    model_tmp = model
+
+    input_depth = num_input_channels
+    for i in range(len(num_channels_down)):
+
+        deeper = nn.Sequential()
+        skip = nn.Sequential()
+
+        if num_channels_skip[i] != 0:
+            model_tmp.add(Concat(1, skip, deeper))
+        else:
+            model_tmp.add(deeper)
+
+        model_tmp.add(bn(num_channels_skip[i] + (num_channels_up[i + 1] if i < last_scale else num_channels_down[i])))
+
+        if num_channels_skip[i] != 0:
+            skip.add(conv(input_depth, num_channels_skip[i], filter_skip_size, bias=need_bias, pad=pad))
+            skip.add(bn(num_channels_skip[i]))
+            skip.add(act(act_fun))
+
+        deeper.add(conv(input_depth, num_channels_down[i], filter_size_down[i], 2, bias=need_bias, pad=pad,
+                        downsample_mode=downsample_mode[i]))
+        deeper.add(bn(num_channels_down[i]))
+        deeper.add(act(act_fun))
+
+        deeper.add(conv(num_channels_down[i], num_channels_down[i], filter_size_down[i], bias=need_bias, pad=pad))
+        deeper.add(bn(num_channels_down[i]))
+        deeper.add(act(act_fun))
+
+        deeper_main = nn.Sequential()
+
+        if i == len(num_channels_down) - 1:
+            # The deepest
+            k = num_channels_down[i]
+        else:
+            deeper.add(deeper_main)
+            k = num_channels_up[i + 1]
+
+        deeper.add(nn.Upsample(scale_factor=2, mode=upsample_mode[i], align_corners=True))
+
+        model_tmp.add(conv(num_channels_skip[i] + k, num_channels_up[i], filter_size_up[i], 1, bias=need_bias, pad=pad))
+        model_tmp.add(bn(num_channels_up[i]))
+        # model_tmp.add(layer_norm(num_channels_up[i]))
+        model_tmp.add(act(act_fun))
+
+        if need1x1_up:
+            model_tmp.add(conv(num_channels_up[i], num_channels_up[i], 1, bias=need_bias, pad=pad))
+            model_tmp.add(bn(num_channels_up[i]))
+            # model_tmp.add(layer_norm(num_channels_up[i]))
+            model_tmp.add(act(act_fun))
+
+        input_depth = num_channels_down[i]
+        model_tmp = deeper_main
+
+    model.add(conv(num_channels_up[0], num_output_channels, 1, bias=need_bias, pad=pad))
+    if need_sigmoid:
+        model.add(nn.Sigmoid())
+    return model
+
+
+def skip_mask(
+        num_input_channels=2, num_output_channels=3,
+        num_channels_down=[16, 32, 64, 128, 128], num_channels_up=[16, 32, 64, 128, 128],
+        num_channels_skip=[4, 4, 4, 4, 4],
+        filter_size_down=3, filter_size_up=3, filter_skip_size=1,
+        need_sigmoid=True, need_bias=True,
+        pad='zero', upsample_mode='nearest', downsample_mode='stride', act_fun='LeakyReLU',
+        need1x1_up=True):
+    """
+    Assembles encoder-decoder with skip connections.
+    Arguments:
+        act_fun: Either string 'LeakyReLU|Swish|ELU|none' or module (e.g. nn.ReLU)
+        pad (string): zero|reflection (default: 'zero')
+        upsample_mode (string): 'nearest|bilinear' (default: 'nearest')
+        downsample_mode (string): 'stride|avg|max|lanczos2' (default: 'stride')
+    """
+    assert len(num_channels_down) == len(num_channels_up) == len(num_channels_skip)
+
+    n_scales = len(num_channels_down)
+
+    if not (isinstance(upsample_mode, list) or isinstance(upsample_mode, tuple)):
+        upsample_mode = [upsample_mode] * n_scales
+
+    if not (isinstance(downsample_mode, list) or isinstance(downsample_mode, tuple)):
+        downsample_mode = [downsample_mode] * n_scales
+
+    if not (isinstance(filter_size_down, list) or isinstance(filter_size_down, tuple)):
+        filter_size_down = [filter_size_down] * n_scales
+
+    if not (isinstance(filter_size_up, list) or isinstance(filter_size_up, tuple)):
+        filter_size_up = [filter_size_up] * n_scales
+
+    last_scale = n_scales - 1
+
+    cur_depth = None
+
+    model = nn.Sequential()
+    model_tmp = model
+
+    input_depth = num_input_channels
+    for i in range(len(num_channels_down)):
+
+        deeper = nn.Sequential()
+        skip = nn.Sequential()
+
+        if num_channels_skip[i] != 0:
+            model_tmp.add(Concat(1, skip, deeper))
+        else:
+            model_tmp.add(deeper)
+
+        model_tmp.add(bn(num_channels_skip[i] + (num_channels_up[i + 1] if i < last_scale else num_channels_down[i])))
+
+        if num_channels_skip[i] != 0:
+            skip.add(conv(input_depth, num_channels_skip[i], filter_skip_size, bias=need_bias, pad=pad))
+            skip.add(bn(num_channels_skip[i]))
+            skip.add(act(act_fun))
+
+        # skip.add(Concat(2, GenNoise(nums_noise[i]), skip_part))
+
+        deeper.add(conv(input_depth, num_channels_down[i], filter_size_down[i], 2, bias=need_bias, pad=pad,
+                        downsample_mode=downsample_mode[i]))
+        deeper.add(bn(num_channels_down[i]))
+        deeper.add(act(act_fun))
+
+        deeper.add(conv(num_channels_down[i], num_channels_down[i], filter_size_down[i], bias=need_bias, pad=pad))
+        deeper.add(bn(num_channels_down[i]))
+        deeper.add(act(act_fun))
+
+        deeper_main = nn.Sequential()
+
+        if i == len(num_channels_down) - 1:
+            # The deepest
+            k = num_channels_down[i]
+        else:
+            deeper.add(deeper_main)
+            k = num_channels_up[i + 1]
+
+        deeper.add(nn.Upsample(scale_factor=2, mode=upsample_mode[i], align_corners=True))
+
+        model_tmp.add(conv(num_channels_skip[i] + k, num_channels_up[i], filter_size_up[i], 1, bias=need_bias, pad=pad))
+        model_tmp.add(bn(num_channels_up[i]))
+        # model_tmp.add(layer_norm(num_channels_up[i]))
+        model_tmp.add(act(act_fun))
+
+        if need1x1_up:
+            model_tmp.add(conv(num_channels_up[i], num_channels_up[i], 1, bias=need_bias, pad=pad))
+            model_tmp.add(bn(num_channels_up[i]))
+            model_tmp.add(act(act_fun))
+
+        input_depth = num_channels_down[i]
+        model_tmp = deeper_main
+
+    model.add(conv(num_channels_up[0], num_output_channels, 1, bias=need_bias, pad=pad))
+    if need_sigmoid:
+        model.add(nn.Sigmoid())
+    return model
+  class double_conv(nn.Module):
+    '''(conv => BN => ReLU) * 2'''
+    def __init__(self, in_ch, out_ch):
+        super(double_conv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x
+
+
+class inconv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(inconv, self).__init__()
+        self.conv = double_conv(in_ch, out_ch)
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x
+
+
+class down(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(down, self).__init__()
+        self.mpconv = nn.Sequential(
+            nn.MaxPool2d(2),
+            double_conv(in_ch, out_ch)
+        )
+
+    def forward(self, x):
+        x = self.mpconv(x)
+        return x
+
+
+class up(nn.Module):
+    def __init__(self, in_ch, out_ch, bilinear=True):
+        super(up, self).__init__()
+
+        #  would be a nice idea if the upsampling could be learned too,
+        #  but my machine do not have enough memory to handle all those weights
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        else:
+            self.up = nn.ConvTranspose2d(in_ch//2, in_ch//2, 2, stride=2)
+
+        self.conv = double_conv(in_ch, out_ch)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffX = x1.size()[2] - x2.size()[2]
+        diffY = x1.size()[3] - x2.size()[3]
+        x2 = F.pad(x2, (diffX // 2, int(diffX / 2),
+                        diffY // 2, int(diffY / 2)))
+        x = torch.cat([x2, x1], dim=1)
+        x = self.conv(x)
+        return x
+
+
+class outconv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(outconv, self).__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, 1)
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x
+
+
+class UNet(nn.Module):
+    def __init__(self, n_channels, n_classes):
+        super(UNet, self).__init__()
+        self.inc = inconv(n_channels, 64)
+        self.down1 = down(64, 128)
+        self.down2 = down(128, 256)
+        self.down3 = down(256, 512)
+        self.down4 = down(512, 512)
+        self.up1 = up(1024, 256)
+        self.up2 = up(512, 128)
+        self.up3 = up(256, 64)
+        self.up4 = up(128, 64)
+        self.outc = outconv(64, n_classes)
+
+    def forward(self, x):
+        self.x1 = self.inc(x)
+        self.x2 = self.down1(self.x1)
+        self.x3 = self.down2(self.x2)
+        self.x4 = self.down3(self.x3)
+        self.x5 = self.down4(self.x4)
+        self.x6 = self.up1(self.x5, self.x4)
+        self.x7 = self.up2(self.x6, self.x3)
+        self.x8 = self.up3(self.x7, self.x2)
+        self.x9 = self.up4(self.x8, self.x1)
+        self.y = self.outc(self.x9)
+        return self.y
+  class UpsamplerModel(nn.Module):
+    def __init__(self, output_shape, factor):
+        assert output_shape[0] % factor == 0
+        assert output_shape[1] % factor == 0
+        super(UpsamplerModel, self).__init__()
+        self.output_shape = output_shape
+        seed = np.ones((1, 1, output_shape[0] // factor, output_shape[1] // factor)) * 0.5
+        self.sigmoid = nn.Sigmoid()
+        self.seed = nn.Parameter(data=torch.cuda.FloatTensor(seed), requires_grad=True)
+
+    def forward(self):
+        return nn.functional.interpolate(self.sigmoid(self.seed), size=self.output_shape, mode='bilinear')
+  class VAE(torch.nn.Module):
+    def __init__(self, size):
+        super().__init__()
+
+        self.encoder = Encoder(size)
+        self.decoder = Decoder(size)
+
+    def getLatent(self, means, var):
+        log_var = var
+        epsilon = torch.randn(means.size()).cuda()
+
+        sigma = torch.exp(0.5 * log_var)
+        z = means + sigma * epsilon
+
+        self.means = means
+        self.var = var
+        return z
+
+    def sample(self):
+        z = self.getLatent(self.means, self.var)
+        return self.decoder(z)
+
+    def forward(self, data):
+        means, var = self.encoder(data)
+        z = self.getLatent(means, var)
+        return self.decoder(z)
+
+    def getLoss(self):
+        #        lossX = torch.nn.functional.mse_loss(res, inputs, reduction='sum')
+
+        log_var = self.var
+        lossKL = 0.5 * torch.sum(log_var.exp() + self.means * self.means - 1 - log_var)
+        #        print(lossX, lossKL)
+        #        loss = lossX + lossKL
+        loss = lossKL
+        return loss
+
+
+class Encoder(torch.nn.Module):
+    def __init__(self, size):
+        super().__init__()
+
+        self.conv1 = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 16, 5, 1, 2),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.MaxPool2d(2)
+        )
+        self.conv2 = torch.nn.Sequential(
+            torch.nn.Conv2d(16, 32, 5, 1, 2),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.MaxPool2d(2)
+        )
+        self.conv3 = torch.nn.Sequential(
+            torch.nn.Conv2d(32, 64, 5, 1, 2),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.MaxPool2d(2)
+        )
+        self.conv4 = torch.nn.Sequential(
+            torch.nn.Conv2d(64, 128, 5, 1, 2),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.MaxPool2d(2)
+        )
+
+        self.fc1 = torch.nn.Linear(int(128 * (size[1] // 16) * (size[2] // 16)), 100)
+        self.fc2 = torch.nn.Linear(int(128 * (size[1] // 16) * (size[2] // 16)), 100)
+
+
+    def forward(self, data):
+
+        data = self.conv1(data)
+
+        data = self.conv2(data)
+
+        data = self.conv3(data)
+
+        data = self.conv4(data)
+
+        data = data.view(data.size(0), -1)
+        means = self.fc1(data)
+        var = self.fc2(data)
+        return means, var
+
+
+#
+
+class Decoder(torch.nn.Module):
+    def __init__(self, size):
+        super().__init__()
+        self.linear0 = torch.nn.Linear(100, int(128 * (size[1] // 16) * (size[2] // 16)))
+
+        self.size = size
+
+        self.conv1 = torch.nn.Sequential(
+            torch.nn.Conv2d(128, 64, 5, 1, 2),
+            torch.nn.BatchNorm2d(64),
+            torch.nn.ReLU(inplace=True)
+        )
+
+        self.conv2 = torch.nn.Sequential(
+            torch.nn.Conv2d(64, 32, 5, 1, 2),
+            torch.nn.BatchNorm2d(32),
+            torch.nn.ReLU(inplace=True)
+        )
+        self.conv3 = torch.nn.Sequential(
+            torch.nn.Conv2d(32, 16, 5, 1, 2),
+            torch.nn.BatchNorm2d(16),
+            torch.nn.ReLU(inplace=True)
+        )
+        self.conv4 = torch.nn.Sequential(
+            torch.nn.Conv2d(16, 3, 5, 1, 2),
+            torch.nn.BatchNorm2d(3),
+            torch.nn.ReLU(inplace=True)
+        )
+
+        self.de = torch.nn.Sequential(
+            torch.nn.Upsample(scale_factor=2, mode='bilinear'),
+            torch.nn.Conv2d(128, 64, 5, 1, 2),
+            torch.nn.BatchNorm2d(64),
+            torch.nn.ReLU(True),
+            torch.nn.Upsample(scale_factor=2, mode='bilinear'),
+            torch.nn.Conv2d(64, 32, 5, 1, 2),
+            torch.nn.BatchNorm2d(32),
+            torch.nn.ReLU(True),
+            torch.nn.Upsample(scale_factor=2, mode='bilinear'),
+            torch.nn.Conv2d(32, 16, 5, 1, 2),
+            torch.nn.BatchNorm2d(16),
+            torch.nn.ReLU(True),
+            torch.nn.Upsample(scale_factor=2, mode='bilinear'),
+            torch.nn.Conv2d(16, 3, 5, 1, 2),
+            torch.nn.Sigmoid()
+        )
+
+    def forward(self, data):
+        data = self.linear0(data)
+        data = data.view(1, -1, self.size[1] // 16, self.size[2] // 16)
+
+        data = self.de(data)
+
+        return data
+
+  
+from collections import namedtuple
+from cv2.ximgproc import guidedFilter
+#from net import *
+#from net.losses import StdLoss
+#from net.vae_model import VAE
+#from utils.imresize import np_imresize
+#from utils.image_io import *
+#from utils.dcp import get_atmosphere
+from skimage.metrics import structural_similarity
+from skimage.metrics import peak_signal_noise_ratio
+import torch
+import torch.nn as nn
+import numpy as np
+  DehazeResult_psnr = namedtuple("DehazeResult_psnr", ['learned', 't', 'a', 'psnr'])
+DehazeResult_ssim = namedtuple("DehazeResult_ssim", ['learned', 't', 'a', 'ssim'])
+
+
+class Dehaze(object):
+    def __init__(self, image_name, image, gt_img, num_iter=500, clip=True, output_path=""):
+        self.image_name = image_name
+        self.image = image
+        self.gt_img = gt_img
+        self.num_iter = num_iter
+        self.ambient_net = None
+        self.image_net = None
+        self.mask_net = None
+        self.ambient_val = None
+        self.mse_loss = None
+        self.learning_rate = 0.001
+        self.parameters = None
+        self.current_result = None
+        self.output_path = output_path
+
+        self.clip = clip
+        self.blur_loss = None
+        self.best_result_psnr = None
+        self.best_result_ssim = None
+        self.image_net_inputs = None
+        self.mask_net_inputs = None
+        self.image_out = None
+        self.mask_out = None
+        self.ambient_out = None
+        self.total_loss = None
+        self.input_depth = 3
+        self.post = None
+        self._init_all()
+
+    def _init_images(self):
+        self.original_image = self.image.copy()
+        self.images_torch = np_to_torch(self.image).type(torch.cuda.FloatTensor)
+
+    def _init_nets(self):
+        input_depth = self.input_depth
+        data_type = torch.cuda.FloatTensor
+        pad = 'reflection'
+
+        image_net = skip(
+            input_depth, 3,
+            num_channels_down=[8, 16, 32, 64, 128],
+            num_channels_up=[8, 16, 32, 64, 128],
+            num_channels_skip=[0, 0, 0, 4, 4],
+            upsample_mode='bilinear',
+            need_sigmoid=True, need_bias=True, pad=pad, act_fun='LeakyReLU')
+        self.image_net = image_net.type(data_type)
+
+        mask_net = skip(
+            input_depth, 1,
+            num_channels_down=[8, 16, 32, 64, 128],
+            num_channels_up=[8, 16, 32, 64, 128],
+            num_channels_skip=[0, 0, 0, 4, 4],
+            upsample_mode='bilinear',
+            need_sigmoid=True, need_bias=True, pad=pad, act_fun='LeakyReLU')
+
+        self.mask_net = mask_net.type(data_type)
+
+    def _init_ambient(self):
+        ambient_net = VAE(self.gt_img.shape)
+        self.ambient_net = ambient_net.type(torch.cuda.FloatTensor)
+
+        atmosphere = get_atmosphere(self.image)
+        self.ambient_val = nn.Parameter(data=torch.cuda.FloatTensor(atmosphere.reshape((1, 3, 1, 1))),
+                                        requires_grad=False)
+        self.at_back = atmosphere
+
+    def _init_parameters(self):
+        parameters = [p for p in self.image_net.parameters()] + \
+                     [p for p in self.mask_net.parameters()]
+        parameters += [p for p in self.ambient_net.parameters()]
+
+        self.parameters = parameters
+
+    def _init_loss(self):
+        data_type = torch.cuda.FloatTensor
+        self.mse_loss = torch.nn.MSELoss().type(data_type)
+        self.blur_loss = StdLoss().type(data_type)
+
+    def _init_inputs(self):
+        self.image_net_inputs = np_to_torch(self.image).cuda()
+        self.mask_net_inputs = np_to_torch(self.image).cuda()
+        self.ambient_net_input = np_to_torch(self.image).cuda()
+
+    def _init_all(self):
+        self._init_images()
+        self._init_nets()
+        self._init_ambient()
+        self._init_inputs()
+        self._init_parameters()
+        self._init_loss()
+
+    def optimize(self):
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
+
+        optimizer = torch.optim.Adam(self.parameters, lr=self.learning_rate)
+        for j in range(self.num_iter):
+            optimizer.zero_grad()
+            self._optimization_closure()
+            self._obtain_current_result(j)
+            self._plot_closure(j)
+            optimizer.step()
+
+    def _optimization_closure(self):
+        self.image_out = self.image_net(self.image_net_inputs)
+        self.ambient_out = self.ambient_net(self.ambient_net_input)
+
+        self.mask_out = self.mask_net(self.mask_net_inputs)
+
+        self.blur_out = self.blur_loss(self.mask_out)
+        self.mseloss = self.mse_loss(self.mask_out * self.image_out + (1 - self.mask_out) * self.ambient_out,
+                                     self.images_torch)
+
+        vae_loss = self.ambient_net.getLoss()
+        self.total_loss = self.mseloss + vae_loss
+        self.total_loss += 0.005 * self.blur_out
+
+        dcp_prior = torch.min(self.image_out.permute(0, 2, 3, 1), 3)[0]
+        self.dcp_loss = self.mse_loss(dcp_prior, torch.zeros_like(dcp_prior)) - 0.05
+        self.total_loss += self.dcp_loss
+
+        self.total_loss += 0.1 * self.blur_loss(self.ambient_out)
+        self.total_loss += self.mse_loss(self.ambient_out, self.ambient_val * torch.ones_like(self.ambient_out))
+
+        self.total_loss.backward(retain_graph=True)
+
+    def _obtain_current_result(self, step):
+        if step % 5 == 0:
+            image_out_np = np.clip(torch_to_np(self.image_out), 0, 1)
+            mask_out_np = np.clip(torch_to_np(self.mask_out), 0, 1)
+            ambient_out_np = np.clip(torch_to_np(self.ambient_out), 0, 1)
+            mask_out_np = self.t_matting(mask_out_np)
+
+            post = np.clip((self.image - ((1 - mask_out_np) * ambient_out_np)) / mask_out_np, 0, 1)
+
+            psnr = peak_signal_noise_ratio(self.gt_img, post)
+            ssims = structural_similarity(self.gt_img.transpose(1, 2, 0), post.transpose(1, 2, 0), multichannel=True)
+
+            self.current_result = DehazeResult_psnr(learned=image_out_np, t=mask_out_np, a=ambient_out_np, psnr=psnr)
+            self.temp = DehazeResult_ssim(learned=image_out_np, t=mask_out_np, a=ambient_out_np, ssim=ssims)
+
+            if self.best_result_psnr is None or self.best_result_psnr.psnr < self.current_result.psnr:
+                self.best_result_psnr = self.current_result
+
+            if self.best_result_ssim is None or self.best_result_ssim.ssim < self.temp.ssim:
+                self.best_result_ssim = self.temp
+
+    def _plot_closure(self, step):
+        """
+         :param step: the number of the iteration
+         :return:
+         """
+        print('Iteration %05d    Loss %f  %f cur_ssim %f max_ssim: %f cur_psnr %f max_psnr %f\n' % (
+                                                                            step, self.total_loss.item(),
+                                                                            self.blur_out.item(),
+                                                                            self.temp.ssim,
+                                                                            self.best_result_ssim.ssim,
+                                                                            self.current_result.psnr,
+                                                                            self.best_result_psnr.psnr), '\r', end='')
+
+    def finalize(self):
+        self.final_image = np_imresize(self.best_result_psnr.learned, output_shape=self.original_image.shape[1:])
+        self.final_t_map = np_imresize(self.best_result_psnr.t, output_shape=self.original_image.shape[1:])
+        self.final_a = np_imresize(self.best_result_psnr.a, output_shape=self.original_image.shape[1:])
+        mask_out_np = self.final_t_map
+        self.post = np.clip((self.original_image - ((1 - mask_out_np) * self.final_a)) / mask_out_np, 0, 1)
+        save_image(self.image_name + "_psnr", self.post, self.output_path)
+
+        self.final_t_map = np_imresize(self.best_result_ssim.t, output_shape=self.original_image.shape[1:])
+        self.final_a = np_imresize(self.best_result_ssim.a, output_shape=self.original_image.shape[1:])
+        mask_out_np = self.final_t_map
+        post = np.clip((self.original_image - ((1 - mask_out_np) * self.final_a)) / mask_out_np, 0, 1)
+
+        save_image(self.image_name + "_ssim", post, self.output_path)
+
+        self.final_t_map = np_imresize(self.current_result.t, output_shape=self.original_image.shape[1:])
+        self.final_a = np_imresize(self.current_result.a, output_shape=self.original_image.shape[1:])
+        mask_out_np = self.t_matting(self.final_t_map)
+        post = np.clip((self.original_image - ((1 - mask_out_np) * self.final_a)) / mask_out_np, 0, 1)
+
+        save_image(self.image_name + "_run_final", post, self.output_path)
+
+    def t_matting(self, mask_out_np):
+        refine_t = guidedFilter(self.original_image.transpose(1, 2, 0).astype(np.float32),
+                                mask_out_np[0].astype(np.float32), 50, 1e-4)
+        if self.clip:
+            return np.array([np.clip(refine_t, 0.1, 1)])
+        else:
+            return np.array([np.clip(refine_t, 0, 1)])
+
+
+def dehaze(image_name, image, gt_img, num_iter=500, output_path=""):
+    dh = Dehaze(image_name, image, gt_img, num_iter, clip=True, output_path=output_path)
+
+    dh.optimize()
+    dh.finalize()
+
+    save_image(image_name + "_original", np.clip(image, 0, 1), dh.output_path)
+
+    psnr = dh.best_result_psnr.psnr
+    ssim = dh.best_result_ssim.ssim
+    return psnr, ssim
+
+
+if __name__ == "__main__":
+
+
+    hazy_add = '/content/input1.jpg'
+    print('d')
+    gt_add = '/content/output1.jpg'
+    print('x')
+    name = "1400_3"
+    print(name)
+
+    hazy_img = prepare_hazy_image(hazy_add)
+    gt_img = prepare_gt_img(gt_add, SOTS=True)
+
+    psnr, ssim = dehaze(name, hazy_img, gt_img, output_path="/content/sample_data/output")
+    print(psnr, ssim)
+  
+       
+           
+      
+           
+
+   
+
+           
+   
+        
